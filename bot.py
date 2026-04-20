@@ -84,6 +84,8 @@ def islem_kaydet(hisse, quantity, price, profit_loss=None):
         headers=NOTION_HEADERS,
         json={"parent": {"database_id": NOTION_ISLEM_DB}, "properties": properties}
     )
+    if r.status_code not in (200, 201):
+        logging.error(f"İşlem DB hatası {r.status_code}: {r.text}")
     return r.status_code in (200, 201)
 
 
