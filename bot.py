@@ -2,53 +2,93 @@ import os
 import re
 import logging
 from datetime import datetime
+import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
-import requests
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
+NOTION_ISLEM_DB = os.environ["NOTION_ISLEM_DB"]
+NOTION_PORTFOY_DB = os.environ["NOTION_PORTFOY_DB"]
 
 logging.basicConfig(level=logging.INFO)
 
+NOTION_HEADERS = {
+    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Notion-Version": "2022-06-28",
+    "Content-Type": "application/json"
+}
 
-def notion_ekle(stock_name, quantity, price, profit_loss=None, position=None):
-    url = "https://api.notion.com/v1/pages"
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json"
+
+# ── Portföyde hisseyi bul ──────────────────────────────────────────
+def portfoy_bul(hisse):
+    """Portföy DB'de hisseyi arar. Bulursa (page_id, lot, avg, total) döner."""
+    url = f"https://api.notion.com/v1/databases/{NOTION_PORTFOY_DB}/query"
+    data = {
+        "filter": {
+            "property": "Hisse",
+            "title": {"equals": hisse.upper()}
+        }
     }
+    r = requests.post(url, headers=NOTION_HEADERS, json=data)
+    results = r.json().get("results", [])
+    if not results:
+        return None
+    page = results[0]
+    props = page["properties"]
+    return {
+        "page_id": page["id"],
+        "lot": props["Toplam Lot"]["number"] or 0,
+        "avg": props["Ortalama Maliyet"]["number"] or 0,
+        "total": props["Toplam Yatırım"]["number"] or 0,
+    }
+
+
+# ── Portföyü güncelle veya oluştur ────────────────────────────────
+def portfoy_guncelle(hisse, yeni_lot, yeni_avg, yeni_total, page_id=None):
+    tarih = datetime.today().strftime("%Y-%m-%d")
     properties = {
-        "Stock Name": {
-            "title": [{"text": {"content": stock_name.upper()}}]
-        },
+        "Hisse": {"title": [{"text": {"content": hisse.upper()}}]},
+        "Toplam Lot": {"number": round(yeni_lot, 4)},
+        "Ortalama Maliyet": {"number": round(yeni_avg, 4)},
+        "Toplam Yatırım": {"number": round(yeni_total, 2)},
+        "Son Güncelleme": {"date": {"start": tarih}},
+    }
+    if page_id:
+        r = requests.patch(
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=NOTION_HEADERS,
+            json={"properties": properties}
+        )
+    else:
+        r = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers=NOTION_HEADERS,
+            json={"parent": {"database_id": NOTION_PORTFOY_DB}, "properties": properties}
+        )
+    return r.status_code in (200, 201)
+
+
+# ── İşlemi Borsa 2026'ya kaydet ───────────────────────────────────
+def islem_kaydet(hisse, quantity, price, profit_loss=None):
+    properties = {
+        "Stock Name": {"title": [{"text": {"content": hisse.upper()}}]},
         "Price": {"number": price},
         "Quantity": {"number": quantity},
-        "Date": {"date": {"start": datetime.today().strftime("%Y-%m-%d")}}
+        "Date": {"date": {"start": datetime.today().strftime("%Y-%m-%d")}},
     }
     if profit_loss is not None:
         properties["Profit/Loss"] = {"number": profit_loss}
-    if position is not None:
-        properties["Position"] = {"number": position}
-
-    data = {
-        "parent": {"database_id": NOTION_DATABASE_ID},
-        "properties": properties
-    }
-    response = requests.post(url, headers=headers, json=data)
-    return response.status_code == 200
+    r = requests.post(
+        "https://api.notion.com/v1/pages",
+        headers=NOTION_HEADERS,
+        json={"parent": {"database_id": NOTION_ISLEM_DB}, "properties": properties}
+    )
+    return r.status_code in (200, 201)
 
 
+# ── Mesajı parse et ───────────────────────────────────────────────
 def mesaj_parse(text):
-    """
-    Desteklenen formatlar:
-    - THYAO 5 adet 200 TL aldım   → quantity: +5
-    - THYAO 5 adet 200 TL sattım  → quantity: -5
-    - THYAO 5 200                  → kısa format
-    - THYAO 5 adet 200 TL kar/zarar: 150 TL
-    """
     text = text.strip()
     parts = text.split()
     if len(parts) < 3:
@@ -68,14 +108,10 @@ def mesaj_parse(text):
     else:
         quantity = abs(quantity)
 
-    return {
-        "stock": stock,
-        "quantity": quantity,
-        "price": price,
-        "profit_loss": profit_loss
-    }
+    return {"stock": stock, "quantity": quantity, "price": price, "profit_loss": profit_loss}
 
 
+# ── Telegram handler ──────────────────────────────────────────────
 async def mesaj_isle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     parsed = mesaj_parse(text)
@@ -88,24 +124,49 @@ async def mesaj_isle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    basari = notion_ekle(
-        stock_name=parsed["stock"],
-        quantity=parsed["quantity"],
-        price=parsed["price"],
-        profit_loss=parsed["profit_loss"]
-    )
+    hisse = parsed["stock"]
+    quantity = parsed["quantity"]
+    price = parsed["price"]
+    is_alis = quantity > 0
 
-    if basari:
-        islem = "📈 Alım" if parsed["quantity"] > 0 else "📉 Satım"
+    # Mevcut portföyü çek
+    mevcut = portfoy_bul(hisse)
+
+    if is_alis:
+        # Alım: ağırlıklı ortalama hesapla
+        eski_lot = mevcut["lot"] if mevcut else 0
+        eski_avg = mevcut["avg"] if mevcut else 0
+        yeni_lot = eski_lot + quantity
+        yeni_avg = ((eski_lot * eski_avg) + (quantity * price)) / yeni_lot
+        yeni_total = yeni_lot * yeni_avg
+    else:
+        # Satım: lot azalt, ortalama maliyet değişmez
+        eski_lot = mevcut["lot"] if mevcut else 0
+        eski_avg = mevcut["avg"] if mevcut else price
+        yeni_lot = eski_lot + quantity  # quantity zaten negatif
+        yeni_avg = eski_avg
+        yeni_total = max(0, yeni_lot * yeni_avg)
+
+    page_id = mevcut["page_id"] if mevcut else None
+    portfoy_ok = portfoy_guncelle(hisse, yeni_lot, yeni_avg, yeni_total, page_id)
+    islem_ok = islem_kaydet(hisse, quantity, price, parsed["profit_loss"])
+
+    if portfoy_ok and islem_ok:
+        islem_adi = "📈 Alım" if is_alis else "📉 Satım"
         await update.message.reply_text(
-            f"✅ Notion'a kaydedildi!\n\n"
-            f"{islem}: {parsed['stock']}\n"
-            f"Adet: {abs(parsed['quantity'])}\n"
-            f"Fiyat: {parsed['price']} ₺"
-            + (f"\nKar/Zarar: {parsed['profit_loss']} ₺" if parsed['profit_loss'] else "")
+            f"✅ Kaydedildi!\n\n"
+            f"{islem_adi}: {hisse}\n"
+            f"Adet: {abs(quantity)}\n"
+            f"Fiyat: {price} ₺\n"
+            f"─────────────\n"
+            f"📊 Portföy Özeti:\n"
+            f"Toplam Lot: {round(yeni_lot, 4)}\n"
+            f"Ort. Maliyet: {round(yeni_avg, 2)} ₺\n"
+            f"Toplam Yatırım: {round(yeni_total, 2)} ₺"
+            + (f"\nKar/Zarar: {parsed['profit_loss']} ₺" if parsed["profit_loss"] else "")
         )
     else:
-        await update.message.reply_text("❌ Notion'a kaydedilemedi. Token veya database ID'yi kontrol et.")
+        await update.message.reply_text("❌ Notion'a kaydedilemedi, token/DB ID'yi kontrol et.")
 
 
 if __name__ == "__main__":
