@@ -166,7 +166,11 @@ async def mesaj_isle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + (f"\nKar/Zarar: {parsed['profit_loss']} ₺" if parsed["profit_loss"] else "")
         )
     else:
-        await update.message.reply_text("❌ Notion'a kaydedilemedi, token/DB ID'yi kontrol et.")
+        await update.message.reply_text(
+            f"❌ Notion hatası!\n"
+            f"İşlem DB: {'✅' if islem_ok else '❌'}\n"
+            f"Portföy DB: {'✅' if portfoy_ok else '❌'}"
+        )
 
 
 if __name__ == "__main__":
